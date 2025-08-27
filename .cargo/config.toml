@@ -1,0 +1,9 @@
+[registries.bpx-cargo-internal]
+index = "sparse+https://bpx-085749067927.d.codeartifact.ap-northeast-1.amazonaws.com/cargo/cargo-internal/"
+credential-provider = "cargo:token-from-stdout aws codeartifact get-authorization-token --domain bpx --domain-owner 085749067927 --region ap-northeast-1 --query authorizationToken --output text"
+
+[registry]
+default = "bpx-cargo-internal"
+
+[source.crates-io]
+replace-with = "bpx-cargo-internal"
