@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{future, stream, Stream, StreamExt};
 use indexmap::IndexMap;
 use protocol::CompressionMethod;
 use tokio::{
@@ -480,9 +480,8 @@ impl Client {
         query: impl TryInto<ParsedQuery, Error = KlickhouseError>,
         blocks: Vec<T>,
     ) -> Result<()> {
-        let blocks = Box::pin(async move { blocks });
-        let stream = futures_util::stream::once(blocks);
-        self.insert_native(query, stream).await
+        self.insert_native(query, stream::once(future::ready(blocks)))
+            .await
     }
 
     /// Runs a query against Clickhouse, returning a stream of deserialized rows.
