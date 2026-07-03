@@ -386,7 +386,9 @@ impl Client {
     }
 
     /// Sends a query string with streaming associated data (i.e. insert) over native protocol.
-    /// Once all outgoing blocks are written (EOF of `blocks` stream), then any response blocks from Clickhouse are read and DISCARDED.
+    /// Outgoing blocks are streamed without waiting for intermediate server responses. Once
+    /// the final empty block is sent, the response is read until the query completes. Server
+    /// exceptions are returned to the caller; other response blocks are discarded.
     /// Make sure any query you send native data with has a `format native` suffix.
     pub async fn insert_native<T: Row + Send + Sync + 'static>(
         &self,
@@ -453,6 +455,21 @@ impl Client {
             column_data: IndexMap::new(),
         })
         .await?;
+        let mut response_buf = Vec::new();
+        // Backpack fix for EXP-4204:
+        // https://linear.app/backpack-company/issue/EXP-4204/clickhouse-native-inserts-can-be-acked-by-the-archiver-before-server
+        // This should likely be merged upstream to the main klickhouse repo.
+        //
+        // Drain the final response so native inserts are not acknowledged before
+        // ClickHouse has accepted the data or returned a server-side exception.
+        loop {
+            if receiver.recv_many(&mut response_buf, 32).await == 0 {
+                break;
+            }
+            for item in response_buf.drain(..) {
+                item?;
+            }
+        }
         Ok(())
     }
 
