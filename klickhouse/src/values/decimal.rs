@@ -90,92 +90,6 @@ impl ToSql for Decimal {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{FromSql, ToSql, Type};
-
-    /// `Decimal(38, 18)` is represented as `Type::Decimal128(18)`.
-    const DECIMAL_38_18: Type = Type::Decimal128(18);
-    const COLUMN_SCALE: u32 = 18;
-    const MAX_I128_REPR: i128 = 0x0000_0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
-
-    fn decimal(mantissa: i128, scale: u32) -> Decimal {
-        Decimal::try_from_i128_with_scale(mantissa, scale).expect("valid test decimal")
-    }
-
-    fn max_mantissa_at_scale(scale: u32) -> i128 {
-        MAX_I128_REPR / 10i128.pow(COLUMN_SCALE - scale)
-    }
-
-    fn roundtrip(value: Decimal) -> Decimal {
-        let stored = value
-            .to_sql(Some(&DECIMAL_38_18))
-            .expect("serializing should succeed");
-        Decimal::from_sql(&DECIMAL_38_18, stored).expect("deserializing should succeed")
-    }
-
-    fn assert_roundtrips(value: Decimal) {
-        assert_eq!(value, roundtrip(value), "value = {value}");
-    }
-
-    #[test]
-    fn decimal128_scale_18_roundtrip() {
-        assert_roundtrips(Decimal::ZERO);
-        assert_roundtrips(decimal(0, COLUMN_SCALE));
-        assert_roundtrips(Decimal::new(12345, 2));
-
-        assert_roundtrips(Decimal::from(1));
-        assert_roundtrips(Decimal::from(10_000_000_000i64));
-        assert_roundtrips(Decimal::from(79_228_162_515i64));
-        assert_roundtrips(Decimal::from(100_000_000_000i64));
-
-        assert_roundtrips(Decimal::from(-10_000_000_000i64));
-        assert_roundtrips(Decimal::from(-100_000_000_000i64));
-        assert_roundtrips(decimal(-7_922_816_251_426, 2));
-
-        for scale in [0, 1, 2, 9, 17] {
-            let max_mantissa = max_mantissa_at_scale(scale);
-            assert_roundtrips(decimal(max_mantissa, scale));
-            assert_roundtrips(decimal(max_mantissa + 1, scale));
-            assert_roundtrips(decimal(-max_mantissa, scale));
-            assert_roundtrips(decimal(-max_mantissa - 1, scale));
-        }
-
-        assert_roundtrips(decimal(12_345, COLUMN_SCALE));
-        assert_roundtrips(decimal(9_999_999_999, COLUMN_SCALE));
-        assert_roundtrips(decimal(MAX_I128_REPR, COLUMN_SCALE));
-        assert_roundtrips(decimal(-MAX_I128_REPR, COLUMN_SCALE));
-    }
-
-    #[test]
-    fn decimal128_scale_18_serialization_errors() {
-        let err = decimal(1, COLUMN_SCALE + 1)
-            .to_sql(Some(&DECIMAL_38_18))
-            .expect_err("scale 19 should not serialize to Decimal128(18)");
-        assert!(matches!(
-            err,
-            KlickhouseError::SerializeError(message) if message.contains("unexpected type")
-        ));
-
-        let err = Decimal::MAX
-            .to_sql(Some(&DECIMAL_38_18))
-            .expect_err("Decimal::MAX should not serialize to Decimal128(18)");
-        assert!(matches!(
-            err,
-            KlickhouseError::SerializeError(message) if message.contains("mantissa")
-        ));
-
-        let err = decimal(10i128.pow(21), 0)
-            .to_sql(Some(&DECIMAL_38_18))
-            .expect_err("mantissa scaling should overflow i128");
-        assert!(matches!(
-            err,
-            KlickhouseError::SerializeError(message) if message.contains("mantissa")
-        ));
-    }
-}
-
 fn out_of_range_error(name: &str) -> KlickhouseError {
     KlickhouseError::DeserializeError(format!("{name} out of bounds for rust_decimal"))
 }
@@ -355,5 +269,131 @@ mod tests {
             err,
             KlickhouseError::SerializeError(message) if message.contains("mantissa")
         ));
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn max_mantissa(column_scale: u32, scale: u32, wire_max: i128) -> i128 {
+            wire_max / 10i128.pow(column_scale - scale)
+        }
+
+        fn mantissa_strategy(limit: i128) -> impl Strategy<Value = i128> {
+            if limit == 0 {
+                Just(0).boxed()
+            } else if limit <= i64::MAX as i128 {
+                (-(limit as i64)..=(limit as i64))
+                    .prop_map(|mantissa| mantissa as i128)
+                    .boxed()
+            } else {
+                let span = (limit as u128).saturating_mul(2).saturating_add(1);
+                any::<u128>()
+                    .prop_map(move |n| (n % span) as i128 - limit)
+                    .boxed()
+            }
+        }
+
+        fn decimal_pair(
+            column_scale_range: impl Strategy<Value = u32>,
+            wire_max: i128,
+            make_type: fn(usize) -> Type,
+        ) -> impl Strategy<Value = (Decimal, Type)> {
+            column_scale_range.prop_flat_map(move |column_scale| {
+                (0u32..=column_scale).prop_flat_map(move |scale| {
+                    let limit = max_mantissa(column_scale, scale, wire_max);
+                    mantissa_strategy(limit).prop_map(move |mantissa| {
+                        (
+                            Decimal::try_from_i128_with_scale(mantissa, scale)
+                                .expect("mantissa should fit in rust_decimal"),
+                            make_type(column_scale as usize),
+                        )
+                    })
+                })
+            })
+        }
+
+        fn serializable_pair() -> impl Strategy<Value = (Decimal, Type)> {
+            prop_oneof![
+                decimal_pair(1u32..=9, i32::MAX as i128, Type::Decimal32),
+                decimal_pair(1u32..=18, i64::MAX as i128, Type::Decimal64),
+                // rust_decimal supports scale <= 28; ClickHouse Decimal128 allows up to 38.
+                decimal_pair(1u32..=28, MAX_I128_REPR, Type::Decimal128),
+            ]
+        }
+
+        fn column_scale_and_name(column_type: &Type) -> (u32, &'static str) {
+            match column_type {
+                Type::Decimal32(column_scale) => (*column_scale as u32, "Decimal32"),
+                Type::Decimal64(column_scale) => (*column_scale as u32, "Decimal64"),
+                Type::Decimal128(column_scale) => (*column_scale as u32, "Decimal128"),
+                _ => panic!("unexpected column type"),
+            }
+        }
+
+        fn wire_strategy() -> impl Strategy<Value = (i128, Type)> {
+            prop_oneof![
+                (any::<i32>(), 1u32..=9).prop_map(|(wire, column_scale)| (
+                    i128::from(wire),
+                    Type::Decimal32(column_scale as usize)
+                )),
+                (any::<i64>(), 1u32..=18).prop_map(|(wire, column_scale)| {
+                    (i128::from(wire), Type::Decimal64(column_scale as usize))
+                }),
+                (any::<i128>(), 1u32..=28).prop_map(|(wire, column_scale)| (
+                    wire,
+                    Type::Decimal128(column_scale as usize)
+                )),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 100_000,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn to_sql_from_sql_roundtrip((value, column_type) in serializable_pair()) {
+                prop_assert_eq!(value, roundtrip(value, &column_type));
+            }
+
+            #[test]
+            fn from_scaled_then_to_sql_roundtrip((wire, column_type) in wire_strategy()) {
+                let (column_scale, name) = column_scale_and_name(&column_type);
+                let parsed = match from_scaled(wire, column_scale, name) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(()),
+                };
+                let stored = match parsed.to_sql(Some(&column_type)) {
+                    Ok(stored) => stored,
+                    Err(_) => return Ok(()),
+                };
+                let back = Decimal::from_sql(&column_type, stored).expect("deserializing should succeed");
+                prop_assert_eq!(parsed, back);
+            }
+
+            #[test]
+            fn to_sql_produces_canonical_wire((wire, column_type) in wire_strategy()) {
+                let (column_scale, name) = column_scale_and_name(&column_type);
+                let parsed = match from_scaled(wire, column_scale, name) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(()),
+                };
+                let stored = match parsed.to_sql(Some(&column_type)) {
+                    Ok(stored) => stored,
+                    Err(_) => return Ok(()),
+                };
+                let encoded_wire = match stored {
+                    Value::Decimal32(_, wire) => i128::from(wire),
+                    Value::Decimal64(_, wire) => i128::from(wire),
+                    Value::Decimal128(_, wire) => wire,
+                    _ => unreachable!("unexpected stored decimal value"),
+                };
+                let reparsed =
+                    from_scaled(encoded_wire, column_scale, name).expect("deserializing should succeed");
+                prop_assert_eq!(parsed, reparsed);
+            }
+        }
     }
 }
