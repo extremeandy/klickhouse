@@ -86,3 +86,89 @@ impl ToSql for Decimal {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FromSql, ToSql, Type};
+
+    /// `Decimal(38, 18)` is represented as `Type::Decimal128(18)`.
+    const DECIMAL_38_18: Type = Type::Decimal128(18);
+    const COLUMN_SCALE: u32 = 18;
+    const MAX_I128_REPR: i128 = 0x0000_0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+
+    fn decimal(mantissa: i128, scale: u32) -> Decimal {
+        Decimal::try_from_i128_with_scale(mantissa, scale).expect("valid test decimal")
+    }
+
+    fn max_mantissa_at_scale(scale: u32) -> i128 {
+        MAX_I128_REPR / 10i128.pow(COLUMN_SCALE - scale)
+    }
+
+    fn roundtrip(value: Decimal) -> Decimal {
+        let stored = value
+            .to_sql(Some(&DECIMAL_38_18))
+            .expect("serializing should succeed");
+        Decimal::from_sql(&DECIMAL_38_18, stored).expect("deserializing should succeed")
+    }
+
+    fn assert_roundtrips(value: Decimal) {
+        assert_eq!(value, roundtrip(value), "value = {value}");
+    }
+
+    #[test]
+    fn decimal128_scale_18_roundtrip() {
+        assert_roundtrips(Decimal::ZERO);
+        assert_roundtrips(decimal(0, COLUMN_SCALE));
+        assert_roundtrips(Decimal::new(12345, 2));
+
+        assert_roundtrips(Decimal::from(1));
+        assert_roundtrips(Decimal::from(10_000_000_000i64));
+        assert_roundtrips(Decimal::from(79_228_162_515i64));
+        assert_roundtrips(Decimal::from(100_000_000_000i64));
+
+        assert_roundtrips(Decimal::from(-10_000_000_000i64));
+        assert_roundtrips(Decimal::from(-100_000_000_000i64));
+        assert_roundtrips(decimal(-7_922_816_251_426, 2));
+
+        for scale in [0, 1, 2, 9, 17] {
+            let max_mantissa = max_mantissa_at_scale(scale);
+            assert_roundtrips(decimal(max_mantissa, scale));
+            assert_roundtrips(decimal(max_mantissa + 1, scale));
+            assert_roundtrips(decimal(-max_mantissa, scale));
+            assert_roundtrips(decimal(-max_mantissa - 1, scale));
+        }
+
+        assert_roundtrips(decimal(12_345, COLUMN_SCALE));
+        assert_roundtrips(decimal(9_999_999_999, COLUMN_SCALE));
+        assert_roundtrips(decimal(MAX_I128_REPR, COLUMN_SCALE));
+        assert_roundtrips(decimal(-MAX_I128_REPR, COLUMN_SCALE));
+    }
+
+    #[test]
+    fn decimal128_scale_18_serialization_errors() {
+        let err = decimal(1, COLUMN_SCALE + 1)
+            .to_sql(Some(&DECIMAL_38_18))
+            .expect_err("scale 19 should not serialize to Decimal128(18)");
+        assert!(matches!(
+            err,
+            KlickhouseError::SerializeError(message) if message.contains("unexpected type")
+        ));
+
+        let err = Decimal::MAX
+            .to_sql(Some(&DECIMAL_38_18))
+            .expect_err("Decimal::MAX should not serialize to Decimal128(18)");
+        assert!(matches!(
+            err,
+            KlickhouseError::SerializeError(message) if message.contains("mantissa")
+        ));
+
+        let err = decimal(10i128.pow(21), 0)
+            .to_sql(Some(&DECIMAL_38_18))
+            .expect_err("mantissa scaling should overflow i128");
+        assert!(matches!(
+            err,
+            KlickhouseError::SerializeError(message) if message.contains("mantissa")
+        ));
+    }
+}
